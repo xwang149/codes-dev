@@ -30,6 +30,7 @@
 #define MAX_STATS 65536
 #define COL_TAG 1235
 #define BAR_TAG 1234
+#define PRINT_SYNTH_TRAFFIC 1
 
 static int msg_size_hash_compare(
             void *key, struct qhash_head *link);
@@ -44,8 +45,9 @@ static int synthetic_pattern = 1;
 static int preserve_wait_ordering = 0;
 static int enable_msg_tracking = 0;
 static int is_synthetic = 0;
-static unsigned long long max_gen_data = 1310720;
+static unsigned long long max_gen_data = 0;
 static int num_qos_levels;
+static double compute_time_speedup;
 tw_lpid TRACK_LP = -1;
 int nprocs = 0;
 static double total_syn_data = 0;
@@ -701,6 +703,9 @@ static void gen_synthetic_tr_rc(nw_state * s, tw_bf * bf, nw_message * m, tw_lp 
 
      if(bf->c5)
          s->is_finished = 0;
+        
+    if(bf->c7)
+        tw_rand_reverse_unif(lp->rng);
 }
 
 /* generate synthetic traffic */
@@ -744,6 +749,16 @@ static void gen_synthetic_tr(nw_state * s, tw_bf * bf, nw_message * m, tw_lp * l
 
             length = 1;
             dest_svr = (int*) calloc(1, sizeof(int));
+            if(s->gen_data == 0)
+            {
+                /*initialize the perm destination to something that is nonzero and thus preventing 
+                  possible attempt at self message*/
+                bf->c7 = 1;
+                s->saved_perm_dest = tw_rand_integer(lp->rng, 0, num_clients - 1);
+                if (s->saved_perm_dest == s->local_rank)
+                    s->saved_perm_dest = (s->local_rank + num_clients/2) % num_clients;
+            }
+
             if(s->gen_data - s->prev_switch >= perm_switch_thresh)
             {
                 // printf("%d - %d >= %d\n",s->gen_data,s->prev_switch,perm_switch_thresh);
@@ -855,7 +870,7 @@ static void gen_synthetic_tr(nw_state * s, tw_bf * bf, nw_message * m, tw_lp * l
     m_new->msg_type = CLI_BCKGND_GEN;
     tw_event_send(e);
     
-    if(num_qos_levels > 1) { //instead of using notify neighbor with QoS, ranks constantly check to see if they have exceeded the hard limit on data - if they have, then they're finished.
+    if (max_gen_data != 0) { //max_gen_data is by default 0 (off). If it's on, then we use it to determine when to finish synth ranks
         if(s->gen_data >= max_gen_data) {
             bf->c5 = 1;
             s->is_finished = 1;
@@ -891,23 +906,24 @@ void arrive_syn_tr(nw_state * s, tw_bf * bf, nw_message * m, tw_lp * lp)
     (void)bf;
     (void)lp;
 
-//    printf("\n Data arrived %d total data %ld ", m->fwd.num_bytes, s->syn_data);
-    if(s->local_rank == 0)
-     {
-    	printf("\n Data arrived %lld rank %llu total data %ld ", m->fwd.num_bytes, s->nw_id, s->syn_data);
-/*	if(s->syn_data > upper_threshold)
-    if(s->local_rank == 0)
-     {
-    	printf("\n Data arrived %lld rank %llu total data %ld ", m->fwd.num_bytes, s->nw_id, s->syn_data);
-	if(s->syn_data > upper_threshold)
-	{ 
-        	struct rusage mem_usage;
-		int who = RUSAGE_SELF;
-		int err = getrusage(who, &mem_usage);
-		printf("\n Memory usage %lf gigabytes", ((double)mem_usage.ru_maxrss / (1024.0 * 1024.0)));
-		upper_threshold += 1048576;
-	}*/
-	}
+    if(PRINT_SYNTH_TRAFFIC) {
+        if(s->local_rank == 0)
+        {
+            printf("\n Data arrived %lld rank %llu total data %ld ", m->fwd.num_bytes, s->nw_id, s->syn_data);
+    /*	if(s->syn_data > upper_threshold)
+        if(s->local_rank == 0)
+        {
+            printf("\n Data arrived %lld rank %llu total data %ld ", m->fwd.num_bytes, s->nw_id, s->syn_data);
+        if(s->syn_data > upper_threshold)
+        { 
+                struct rusage mem_usage;
+            int who = RUSAGE_SELF;
+            int err = getrusage(who, &mem_usage);
+            printf("\n Memory usage %lf gigabytes", ((double)mem_usage.ru_maxrss / (1024.0 * 1024.0)));
+            upper_threshold += 1048576;
+        }*/
+        }
+    }
     m->rc.saved_send_time = s->send_time;
     m->rc.saved_send_time_sample = s->ross_sample.send_time;
     if((tw_now(lp) - m->fwd.sim_start_time) > s->max_time)
@@ -1459,9 +1475,9 @@ static void codes_exec_comp_delay(
 
     m->rc.saved_delay = s->compute_time;
     m->rc.saved_delay_sample = s->ross_sample.compute_time;
-    s->compute_time += mpi_op->u.delay.nsecs;
-    s->ross_sample.compute_time += mpi_op->u.delay.nsecs;
-    ts = mpi_op->u.delay.nsecs;
+    s->compute_time += (mpi_op->u.delay.nsecs/compute_time_speedup);
+    s->ross_sample.compute_time += (mpi_op->u.delay.nsecs/compute_time_speedup);
+    ts = (mpi_op->u.delay.nsecs/compute_time_speedup);
     if(ts <= g_tw_lookahead)
     {
         bf->c28 = 1;
@@ -2832,7 +2848,7 @@ const tw_optdef app_opt [] =
 	TWOPT_UINT("num_net_traces", num_net_traces, "number of network traces"),
 	TWOPT_UINT("priority_type", priority_type, "Priority type (zero): high priority to foreground traffic and low to background/2nd job, (one): high priority to collective operations "),
 	TWOPT_UINT("payload_sz", payload_sz, "size of payload for synthetic traffic "),
-	TWOPT_ULONGLONG("max_gen_data", max_gen_data, "maximum data to be generated for synthetic traffic "),
+	TWOPT_ULONGLONG("max_gen_data", max_gen_data, "maximum data to be generated for synthetic traffic (Default 0 (OFF))"),
 	TWOPT_UINT("eager_threshold", EAGER_THRESHOLD, "the transition point for eager/rendezvous protocols (Default 8192)"),
     TWOPT_UINT("disable_compute", disable_delay, "disable compute simulation"),
     TWOPT_UINT("payload_sz", payload_sz, "size of the payload for synthetic traffic"),
@@ -2958,6 +2974,19 @@ static int msg_size_hash_compare(
 
     return 0;
 }
+
+/* Method to organize all mpi_replay specific configuration parameters
+to be specified in the loaded .conf file*/
+void modelnet_mpi_replay_read_config()
+{
+    // Load the factor by which the compute time is sped up by. e.g. If compute_time_speedup = 2, all compute time delay is halved.
+    int rc = configuration_get_value_double(&config, "PARAMS", "compute_time_speedup", NULL, &compute_time_speedup);
+    if (rc) {
+        compute_time_speedup = 1;
+    }
+}
+
+
 int modelnet_mpi_replay(MPI_Comm comm, int* argc, char*** argv )
 {
   int rank;
@@ -3025,6 +3054,7 @@ int modelnet_mpi_replay(MPI_Comm comm, int* argc, char*** argv )
             {
               num_syn_clients += num_traces_of_job[i];
               num_net_traces += num_traces_of_job[i];
+              is_synthetic = 1;
             }
             else if(ref!=EOF)
             {
@@ -3074,6 +3104,8 @@ int modelnet_mpi_replay(MPI_Comm comm, int* argc, char*** argv )
 //   assert(num_nets == 1);
    net_id = *net_ids;
    free(net_ids);
+
+   modelnet_mpi_replay_read_config();
 
    if(enable_debug)
    {
@@ -3171,7 +3203,7 @@ int modelnet_mpi_replay(MPI_Comm comm, int* argc, char*** argv )
     double total_avg_send_time, total_max_send_time;
      double total_avg_wait_time, total_max_wait_time;
      double total_avg_recv_time, total_max_recv_time;
-     double g_total_syn_data;
+     double g_total_syn_data = 0;
 
     MPI_Reduce(&num_bytes_sent, &total_bytes_sent, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_CODES);
     MPI_Reduce(&num_bytes_recvd, &total_bytes_recvd, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_CODES);
@@ -3209,7 +3241,7 @@ int modelnet_mpi_replay(MPI_Comm comm, int* argc, char*** argv )
         assert(ret == 0 || !"lp_io_flush failure");
     }
     if(is_synthetic)
-        printf("\n Synthetic traffic stats: data received per proc %lf bytes \n", g_total_syn_data/num_syn_clients);
+        printf("\n PE%d: Synthetic traffic stats: data received per proc %lf bytes \n",rank, g_total_syn_data/num_syn_clients);
 
    model_net_report_stats(net_id);
    
